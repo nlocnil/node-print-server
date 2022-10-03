@@ -1,53 +1,58 @@
 import express from 'express';
-import cors from 'cors';
 import storage from 'node-persist';
 import fastStringify from 'fast-stringify';
 import ptp from 'pdf-to-printer';
 import fs from 'fs';
 import colors from 'colors';
 import path from 'path';
-import helmet from 'helmet';
 import { uid } from 'uid/single';
-import { title } from 'process';
 import os, { platform } from 'os';
 import bodyParser from 'body-parser';
-import Ajv from "ajv";
+import AJV from "ajv";
 import addFormats from "ajv-formats"
-import find from 'local-devices' //To search local network.
 
 
-/**
- * SEND TYPE
- * CUT:ZPL 
- * PDF:ASM: , FUCKING DUMBASS.
- */
-const SERVER_VERSION = '0.0.8';
+
+// Constants
+const SERVER_VERSION = '0.0.9';
 const PLATFORM_TO_SYSTEM = {
-    'win32': 'WIN',
-    'darwin': 'MAC',
-    'linux': 'LNX',
-    'WIN': 'Windows',
-    'MAC': 'Mac',
-    'LNX': 'Linux'
+    win32: 'Windows',
+    darwin: 'Mac',
+    linux: 'Linux',
+};
+var SYSTEM;
+try {
+    SYSTEM = PLATFORM_TO_SYSTEM[os.platform().toString()];
+} catch (e) {
+    console.log(`Error: Platform ${os.platform()} not supported.`.red.bold);
+    process.exit(1);
 }
-const SYSTEM = PLATFORM_TO_SYSTEM[os.platform];
-const PORT = 3000;
-const ajv = new Ajv();
-addFormats(ajv);
-const app = express();
-const tempFileIDs = [];
 
-//stores persistent storage.
+const PORT = 3000;
+const PRINTERS = {
+    available: [],
+    any: async function () {
+        return this.available.length > 1;
+    },
+    isAvailable: async function (deviceId) {
+        return this.available.includes(deviceId);
+    }
+};
+
+const app = express();
+const requestIDs = [];
+const ajv = new AJV();
+addFormats(ajv);
+
 const persistent = {
     templates: null,
     printers: null
-}
+};
 
-/** 
- * Validators for the parsed POST.
- * ZPL for {'type':'ZPL'}, and PDF for {'type':'PDF'}
- * 
-*/
+//Validators
+/**
+ * JSON SCHEMAS AND COMPILED VALIDATORS
+ */
 const JSONValidators = {
     schemas: {
         all: {
@@ -126,7 +131,7 @@ const JSONValidators = {
                 }
             }
         },
-        
+
     },
     PDF: null,
     ZPL: null,
@@ -136,9 +141,9 @@ const JSONValidators = {
     DEVICE: null,
     IP_ADDRESS: null,
     init: function () {
-        this.ALL = ajv.compile(this.schemas.all); 
-        this.PDF = ajv.compile(this.schemas.pdf); 
-        this.ZPL = ajv.compile(this.schemas.zpl); 
+        this.ALL = ajv.compile(this.schemas.all);
+        this.PDF = ajv.compile(this.schemas.pdf);
+        this.ZPL = ajv.compile(this.schemas.zpl);
         this.NET = ajv.compile(this.schemas.net);
         this.IP4 = ajv.compile(this.schemas.ip4);
         this.IP6 = ajv.compile(this.schemas.ip6);
@@ -149,22 +154,25 @@ const JSONValidators = {
 };
 
 /**
- * Accepts either ipv4 || ipv6 strings and determines whether or nit
+ * Asynchronous function that accepts either ipv4 || ipv6 strings and determines whether the
+ * given string is an ipv4 or ipv6 address and whether or not it is a valid ip address, returning an object that contains
+ * the results.
+ * 
+ * Must be run after the compileJSONValidators step, as it is reliant on the Validators compiled by Ajv with the defined JSON Schema.
  */
-const validateIPAddress = function (address) {
+const validateIPAddress = async function (address) {
     let result = {
+        type: null,
         address: null,
-        ipv4: null,
-        ipv6: null,
         valid: false
     }
     target.address = "";
-    if (JSONValidators.IP4({ip: address})) {
-        result.address = 'ipv4';
-        result.ipv4 = address;
-    } else if (JSONValidators.IP6({ip: address})) {
-        result.address = 'ipv6';
-        result.ipv6 = address;
+    if (JSONValidators.IP4({ ip: address })) {
+        result.type = 'ipv4';
+        result.address = address;
+    } else if (JSONValidators.IP6({ ip: address })) {
+        result.type = 'ipv6';
+        result.address = address;
     }
     if (result.address)
         result.valid = true;
@@ -172,16 +180,11 @@ const validateIPAddress = function (address) {
 }
 
 
-
-
-
+//Helper Functions
 /**
  * The node module, uid, maintains an internal buffer up to 512 ids for the cryptographically insecure
  * version using Math.random, therefore there is a soft cap of of 512 print orders coming through the 
  * server at once before the possibility of collision can occur.
-*/
-
-/**
  * safeUID solves the uid node module 512 limit, 
  * and makes possibilities of id collisions near impossible by externally checking against an 
  * array of used values, and reruns it up to a default 512 times. 
@@ -194,12 +197,12 @@ const validateIPAddress = function (address) {
  * the uIDLength.
  */
 const safeUID = async function (outOf = [], _uIDLength, maxAttempts = 512) {
-    let uIDLength = _uIDLength ?? (6 + Math.floor((Math.random() * 11))); 
+    let uIDLength = _uIDLength ?? (6 + Math.floor((Math.random() * 11)));
 
     let uniqueID = uid(uIDLength);
     if (outOf.includes(uniqueID))
         return uniqueID;
-    
+
     for (let attempts = 0; attempts < maxAttempts; attempts++) {
         uniqueID = uid(uIDLength);
         if (!outOf.includes(uniqueID)) {
@@ -210,8 +213,6 @@ const safeUID = async function (outOf = [], _uIDLength, maxAttempts = 512) {
     outOf.push(uniqueID);
     return uniqueID;
 }
-
-
 
 /**
  * Asynchronous function to check if file exists. DO NOT USE IN ENSURE FUNCTIONS.
@@ -232,14 +233,7 @@ const fileExists = async function (filePath) {
 }
 
 /**
- * creates directory if doesn't exist and returns the path, and whether mkdir was needed; 
- * @param {string} path - path to directory.
- * @param {boolean} logFlag - whether to log results of function towards console. 
- * Relies on colors for nicer logging, and path for validation of directory paths.
- * @returns {object} 
- * {path: string
- *  existed: boolean 
- * }
+ *  creates directory if doesn't exist and returns the path, and whether mkdir was needed; 
  */
 const ensureDirectory = async function (_path, logFlag = false) {
     let existed = false;
@@ -261,7 +255,7 @@ const ensureDirectory = async function (_path, logFlag = false) {
     } finally {
         if (logFlag)
             console.log('Directory:'.green, `${path.basename(directoryPath)} `.green.bold,
-            ((existed) ? 'was just created' : 'already existed ').green,
+                ((existed) ? 'was just created' : 'already existed ').green,
                 'in:'.green, `${'./' + path.dirname(directoryPath)}`.green.bold, '\n');
         return {
             _path: directoryPath,
@@ -270,34 +264,192 @@ const ensureDirectory = async function (_path, logFlag = false) {
     }
 };
 
+/**
+ * updates an array of available printers to avoid calling the ptp.getPrinters each time a post request is made.
+ * Instead it checks whether the printer is available within the PRINTERS.available list, and is run
+ * every ${UPDATE_AVAILABLE_PRINTERS_EVERY_MS}.
+ */
+const updatePrinters = async function () {
+    try {
+        PRINTERS.available = await ptp.getPrinters();
+        if (!PRINTERS.any())
+            throw new Error('No Printers available.');
+    } catch (error) {
+        console.log(error.message.toString().red, '\n');
+    }
+}
 
+//Custom Middleware
+/**
+ * Simply Tags Requests with a collision resistant uniqueID.
+ */
+const tagRequests = async function (request, resolution, next) {
+    request.uniqueId = await safeUID(requestIDs, 10, 2048);
+    next();
+}
+/**
+ * Simple Middleware that uses compiled AVJ JSON Validator 
+ * functions to quickly validate the incoming Print Requests.
+*/
+const validatePrintRequests = async function (request, resolution, next) {
+    request.valid = JSONValidators.ALL(request?.body);
+    if (request.valid) {
+        let type = request.body.datatype
+        request.valid = JSONValidators[type](request.body);
+    }
+    request.invalid = !request.valid;
+    next();
+}
+
+
+
+
+
+//Set Intervals
+const UPDATE_AVAILABLE_PRINTERS_EVERY_MS = 1000 * 60 * 15;
+setInterval(updatePrinters, UPDATE_AVAILABLE_PRINTERS_EVERY_MS);
+
+
+//Print functions.
+/**
+ * Uses ptp to print PDFs using passed in request.
+ * request is tagged with printing.
+ */
+const printPDF = async function (request) {
+    try {
+        let content = Buffer.from(request.body.content, 'base64');
+        const filePath = path.resolve(__dirname, `./storage/temp/${request.uniqueId}.pdf`);
+        await fs.promises.writeFile(filePath, content);
+
+        const options = {
+            printer: request.body.printer
+        };
+
+        await ptp.print(filePath, options);
+        request._result.success = true;
+    } catch (error) { request._result.success = false }
+    finally {
+        const index = requestIDs.indexOf(request.uniqueId)
+        requestIDs.splice(index, 1);
+        try {
+            await fs.promises.unlink(request.uniqueId);
+            return;
+        } catch (error) {
+            if (error.code === 'ENOENT')
+                return;
+            else
+                throw error;
+        }
+    }
+
+
+}
+
+const printZPL = async function (request) {
+    //TODO
+}
+
+
+
+
+
+//Route Definitions
 
 /**
- * Makes sure that server folder structure is properly setup, and that all folders exists.
+ * Serves the Server Page.
  */
-const setupDirectoryStructure = async function () {
+const onGet = async function (request, resolution) {
     try {
-        console.log(`Running Directory Structure Setup for Print-Server...`.yellow);
+        resolution.json({
+            success: true,
+            msg: "Get Request..."
+        });
+    } catch (error) {
+        console.log(`${error}`.red);
+    }
+}
+
+
+const onPost = async function (request, resolution) {
+    request._result = {
+        success: false,
+        message: ""
+    }
+
+    try {
+        if (request.invalid)
+            throw new Error(`Invalid Request according to AVJ Validation.`);
+
+        if (!PRINTERS.any())
+            throw new Error(`No Printers Available.`);
+
+        if (!PRINTERS.isAvailable(request.body.printer))
+            throw new Error(`Printer specified in request unavailable.`);
+
+        if (request.body.datatype = "PDF")
+            await printPDF(request);
+        else if (request.body.datatype = "ZPL")
+            await printZPL(request); //TODO
+
+        if (!request._result.success)
+            throw new Error(`Print '${request.body.datatype}' Process failed.`);
+        
+
+    } catch (error) {
+        request._result.success = false;
+        request._result.message = await step.errorHandler.exception(error);
+    }
+    finally {
+        resolution.send(request._result);
+    }
+}
+
+
+
+
+
+//step - just quick function defs for logging the start, success, and failing of a load step.
+const step = {
+    start: (str) => { console.log(str.yellow) },
+    success: (str) => { console.log(`${str.green}\n`) },
+    fail: (str) => { throw new Error(str) },
+    errorHandler: {
+        startup: async (error) => {
+            console.log(error.message.toString().red, '\n');
+            console.log('Server Startup Process failed...'.red.bold);
+            process.exit(1)
+        },
+        exception: async (error) => {
+            console.log(error.message.toString().red, '\n');
+            return error.message;
+        }
+    }
+
+};
+
+
+const setupDirectoryStructure = async function () {
+    step.start(`Running Directory Structure Setup for Print-Server...`);
+
+    try {
         let temp = ensureDirectory('./storage/temp/files');
         let templates = ensureDirectory('./storage/persistent/templates');
         let printers = ensureDirectory('./storage/persistent/printers');
-        let serverpage = ensureDirectory('./static/serverpage');
+        let statics = ensureDirectory('./storage/static');
         await temp;
         await templates;
         await printers;
-        await serverpage;
-    } catch (error) {
-        console.log('Directory Structure Setup Failed.'.red, '\n');
-        throw error
-    }
-    console.log('Directory Structure Setup Completed.'.green, '\n');
-    return;
+        await statics;
+    } catch { step.fail('Directory Structure Setup Failed.') };
+
+    step.success('Directory Structure Setup Completed.');
 }
 
 const setupPersistentStorage = async function () {
-    console.log(`Running Persistent Storage Setup for Print-Server...`.yellow);
+    step.start(`Running Persistent Storage Setup for Print-Server...`.yellow);
+
     try {
-        
+
         const templates = storage.create({
             dir: './storage/persistent/templates',
             stringify: fastStringify,
@@ -315,164 +467,87 @@ const setupPersistentStorage = async function () {
             forgiveParseErrors: false,
             ttl: false
         });
-        
+
         await templates.init();
         await printers.init();
 
         persistent.templates = templates;
         persistent.printers = printers;
-    } catch (error) {
-        console.log('Persistent Storage Setup Failed.'.red, '\n');
-        throw error
-    }
-    console.log('Persistent Storage Setup Completed.'.green, '\n');
+    } catch { step.fail('Persistent Storage Setup Failed.') }
+
+    step.success('Persistent Storage Setup Completed.');
 }
 
+const compileJSONValidators = async function () {
+    step.start('Compiling AVJ JSON Schema into Validators...');
 
-const onStartup = async function () {
-    await setupDirectoryStructure();
-    await setupPersistentStorage();
-
-    console.log('Storage Setup Completed.'.green,'\n');
-    return;
-}
-
-
-const onListen = async function () {
     try {
-        console.log(`Wipfli Print-Server Version: ${SERVER_VERSION.white.bold} `.yellow + `now listening on port:`.yellow, `${PORT}`.white.bold, '\n');
-
-
-
-    } catch (error) {
-        throw error
+        JSONValidators.init();
     }
+    catch { step.fail('AVJ JSON Schemas failed to compile into Validators.') }
+
+    step.success('AVJ JSON Schemas successfully compiled into Validators.');
 }
 
-const getStatic = async function (file) {
-    return;
-}
+const includeMiddleware = async function () {
+    step.start('Including Middleware...'.yellow);
 
-const onGet = async function (request, resolution) {
     try {
-        resolution.set('Content-Type', 'text/html')
-        resolution.sendFile(path.resolve(path.join(path.dirname('storage'), '/page/index.html')));
+        app.use(tagRequests);
+        app.use(bodyParser.urlencoded({ extended: true }));
+        app.use(validatePrintRequests);
+    }
+    catch { step.fail('Failed to include Middleware...') }
 
-    } catch (e) {
-        console.log(e);
-    }
+    step.success('Middleware successfully included.'.green);
+}
 
-}
-/**
- * Simple Middleware that uses compiled AVJ JSON Validator 
- * functions to quickly validate the incoming Print Requests.
-*/
-const validateRequests = async function (request, resolution, next) {
-    request.valid = JSONValidators.ALL(request?.body);
-    if (request.valid) {
-        let type = request.body.datatype
-        request.valid = JSONValidators[type](request.body);
-    }
-    request.invalid = !request.valid;
-    next();
-}
-/**
- * Accepts 
- * IP || deviceID for Printer
- * type: PDF || ZPL
- * ZPL: {variables}
- * content: 
- */
-const onPost = async function (request, resolution) {
-    let status = {
-        success: false,
-        message: ""
-    }
+const defineRoutes = async function () {
+    step.start('Defining Routes...'.yellow);
+
     try {
-        //does an initial validation.
-        if (request.invalid)
-            throw new Error(`Invalid Request according to AVJ Validation.`);
-        
+        app.get('/', onGet);
+        app.post('/', onPost);
+    } catch { step.fail('Failed to define Routes.') }
 
+    step.success('Routes successfully defined.'.green);
+}
+
+const listen = async function () {
+    step.start(`Attempting to listen on port: ${PORT.toString().bold}...`);
+
+    try {
+        app.listen(PORT);
+    } catch { step.fail(`Server failed to listen on ${PORT.toString().bold}`) }
+
+    step.success(`Server successfully listening on Port: ${PORT.toString().bold}`)
+}
+
+
+const run = async function () {
+    try {
+        step.start(`Running S tartup Process for Wipfli Print-Server Version: ${SERVER_VERSION.toString().white.bold}\n`);
+
+        await setupDirectoryStructure();
+
+        await setupPersistentStorage();
+
+        await compileJSONValidators();
+
+        await includeMiddleware();
+
+        await defineRoutes();
+
+        await listen();
+
+        step.success('Server Startup Process completed successfully.');
     } catch (error) {
-        console.log(error.message.red);
-        status.message = error.message;
-        
+        //Shuts down server if error is thrown up by step.fail();
+        await step.errorHandler.startup(error);
     } finally {
-        resolution.send(status);
-    }
-}
-
-const printPDF = async function (pdf) {
-    
-};
-
-
-const PrintRequest = {
-
-    onFail: async function (req, res) {
-    
-    },
-
-     onSuccess: async function (req, res) {
+        //SUCCESS. THROWING ERR: SENDS OUT process.exit(1); Closes program after logging error message to console.
 
     }
 }
 
-const launch = async function () {
-    console.log(`Launching Wipfli Print-Server Version ${SERVER_VERSION.white.bold}`.yellow ,'for:'.yellow, PLATFORM_TO_SYSTEM[SYSTEM].white.bold, '\n');
-    onStartup()
-        .then(() => {
-            console.log('Compiling AVJ JSON Schema into Validators...'.yellow);
-            try {
-                JSONValidators.init();
-                console.log('AVJ JSON Schemas successfully compiled into Validators.'.green);
-            } catch (error) {
-                console.log('AVJ JSON Schemas failed to compile into Validators...'.red);
-                throw error;
-            } finally {
-                console.log('');
-            }
-        })
-        .then(() => {
-            try {
-                console.log('Including Middleware...'.yellow)
-                app.use(cors());
-                app.use(helmet());
-                app.use(bodyParser.urlencoded({ extended: true }))
-                app.use(validateRequests);
-                console.log('Middleware successfully included...'.green);
-            } catch (error) {
-                console.log('Failed to include Middleware...'.red);
-                throw error;
-            } finally {
-                console.log('');
-            }
-        })
-        .then(() => {
-            try {
-                console.log('Defining Routes...'.yellow);
-                //DEFINE ROUTES HERE
-                app.get('/', onGet);
-                app.post('/', onPost);
-                console.log('Routes successfully defined.'.green);
-            } catch (error) {
-                console.log('Failed to define Routes.'.red);
-                throw error;
-            } finally {
-                console.log('');
-            }
-        })
-        .then(() => {
-            console.log('Server Startup Process completed successfully.'.green.bold, '\n');
-            app.listen(3000, onListen);
-        })
-        .catch(function (error) {
-            console.log('Server Startup Process failed...'.red.bold, '\n');
-            console.log('ERROR: '.red, `${error}`.red.bold);
-            process.exit(1);
-        });
-};
-
-
-launch();
+run();
